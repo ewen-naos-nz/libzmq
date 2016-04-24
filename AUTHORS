@@ -7,11 +7,12 @@ Copyright (c) 2010-2011 Miru Limited
 Copyright (c) 2011 VMware, Inc.
 Copyright (c) 2012 Spotify AB
 Copyright (c) 2013 Ericsson AB
+Copyright (c) 2014 AppDynamics Inc.
 
 Individual Contributors
 =======================
 
-AJ Lewis 
+AJ Lewis
 Alexej Lotz 
 Andrew Thompson 
 Asko Kauppi 
@@ -34,10 +35,12 @@ Christian Gudrian
 Christian Kamm 
 Chuck Remes 
 Conrad D. Steenberg 
-Dhammika Pathirana 
+Constantin Rack
+Daniel J. Bernstein
+Dhammika Pathirana
 Dhruva Krishnamurthy 
 Dirk O. Kaar 
-Douglas Creager 
+Douglas Creager
 Drew Crawford 
 Erich Heine 
 Erik Hugne 
@@ -51,6 +54,7 @@ Gonzalo Diethelm
 Guido Goldstein 
 Ian Barber 
 Ilja Golshtein 
+Ilya Kulakov 
 Ivo Danihelka 
 Jacob Rideout 
 Joe Thornber 
@@ -58,6 +62,7 @@ Jon Dyte
 Kamil Shakirov 
 Ken Steele 
 Laurent Alebarde 
+Luca Boccassi
 Marc Rossi 
 Mark Barbisan 
 Martin Hurton 
@@ -85,6 +90,7 @@ Philip Kovacs
 Pieter Hintjens 
 Piotr Trojanek 
 Richard Newton 
+Rik van der Heijden
 Robert G. Jakabosky 
 Sebastian Otaegui 
 Stefan Radomski 
@@ -104,6 +110,8 @@ Lourens Naudé
 Hardeep Singh 
 André Caron 
 Tim Mossbarger 
+Doron Somech
+Osiris Pedroso
 
 Credits
 =======

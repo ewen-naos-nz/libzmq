@@ -1,22 +1,34 @@
 /*
-    Copyright (c) 2007-2014 Contributors as noted in the AUTHORS file
+    Copyright (c) 2007-2016 Contributors as noted in the AUTHORS file
 
-    This file is part of 0MQ.
+    This file is part of libzmq, the ZeroMQ core engine in C++.
 
-    0MQ is free software; you can redistribute it and/or modify it under
-    the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 3 of the License, or
+    libzmq is free software; you can redistribute it and/or modify it under
+    the terms of the GNU Lesser General Public License (LGPL) as published
+    by the Free Software Foundation; either version 3 of the License, or
     (at your option) any later version.
 
-    0MQ is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
+    As a special exception, the Contributors give you permission to link
+    this library with independent modules to produce an executable,
+    regardless of the license terms of these independent modules, and to
+    copy and distribute the resulting executable under terms of your choice,
+    provided that you also meet, for each linked independent module, the
+    terms and conditions of the license of that module. An independent
+    module is a module which is not derived from or based on this library.
+    If you modify this library, you must extend this exception to your
+    version of the library.
+
+    libzmq is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public
+    License for more details.
 
     You should have received a copy of the GNU Lesser General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "precompiled.hpp"
+#include "macros.hpp"
 #include "session_base.hpp"
 #include "i_engine.hpp"
 #include "err.hpp"
@@ -26,25 +38,36 @@
 #include "ipc_connecter.hpp"
 #include "tipc_connecter.hpp"
 #include "socks_connecter.hpp"
+#include "vmci_connecter.hpp"
 #include "pgm_sender.hpp"
 #include "pgm_receiver.hpp"
 #include "address.hpp"
 #include "norm_engine.hpp"
+#include "udp_engine.hpp"
 
 #include "ctx.hpp"
 #include "req.hpp"
+#include "radio.hpp"
+#include "dish.hpp"
 
 zmq::session_base_t *zmq::session_base_t::create (class io_thread_t *io_thread_,
     bool active_, class socket_base_t *socket_, const options_t &options_,
     address_t *addr_)
 {
-	
     session_base_t *s = NULL;
     switch (options_.type) {
     case ZMQ_REQ:
         s = new (std::nothrow) req_session_t (io_thread_, active_,
             socket_, options_, addr_);
         break;
+    case ZMQ_RADIO:
+        s = new (std::nothrow) radio_session_t (io_thread_, active_,
+            socket_, options_, addr_);
+        break;
+    case ZMQ_DISH:
+        s = new (std::nothrow) dish_session_t (io_thread_, active_,
+            socket_, options_, addr_);
+            break;
     case ZMQ_DEALER:
     case ZMQ_REP:
     case ZMQ_ROUTER:
@@ -56,6 +79,10 @@ zmq::session_base_t *zmq::session_base_t::create (class io_thread_t *io_thread_,
     case ZMQ_PULL:
     case ZMQ_PAIR:
     case ZMQ_STREAM:
+    case ZMQ_SERVER:
+    case ZMQ_CLIENT:
+    case ZMQ_GATHER:
+    case ZMQ_SCATTER:
         s = new (std::nothrow) session_base_t (io_thread_, active_,
             socket_, options_, addr_);
         break;
@@ -100,7 +127,7 @@ zmq::session_base_t::~session_base_t ()
     if (engine)
         engine->terminate ();
 
-    delete addr;
+    LIBZMQ_DELETE(addr);
 }
 
 void zmq::session_base_t::attach_pipe (pipe_t *pipe_)
@@ -126,6 +153,8 @@ int zmq::session_base_t::pull_msg (msg_t *msg_)
 
 int zmq::session_base_t::push_msg (msg_t *msg_)
 {
+    if(msg_->flags() & msg_t::command)
+        return 0;
     if (pipe && pipe->write (msg_)) {
         int rc = msg_->init ();
         errno_assert (rc == 0);
@@ -207,9 +236,14 @@ void zmq::session_base_t::pipe_terminated (pipe_t *pipe_)
              || pipe_ == zap_pipe
              || terminating_pipes.count (pipe_) == 1);
 
-    if (pipe_ == pipe)
+    if (pipe_ == pipe) {
         // If this is our current pipe, remove it
         pipe = NULL;
+        if (has_linger_timer) {
+            cancel_timer (linger_timer_id);
+            has_linger_timer = false;
+        }
+    }
     else
     if (pipe_ == zap_pipe)
         zap_pipe = NULL;
@@ -217,7 +251,7 @@ void zmq::session_base_t::pipe_terminated (pipe_t *pipe_)
         // Remove the pipe from the detached pipes set
         terminating_pipes.erase (pipe_);
 
-    if (!is_terminating () && options.raw_sock) {
+    if (!is_terminating () && options.raw_socket) {
         if (engine) {
             engine->terminate ();
             engine = NULL;
@@ -228,14 +262,16 @@ void zmq::session_base_t::pipe_terminated (pipe_t *pipe_)
     //  If we are waiting for pending messages to be sent, at this point
     //  we are sure that there will be no more messages and we can proceed
     //  with termination safely.
-    if (pending && !pipe && !zap_pipe && terminating_pipes.empty ())
-        proceed_with_term ();
+    if (pending && !pipe && !zap_pipe && terminating_pipes.empty ()) {
+        pending = false;
+        own_t::process_term (0);
+    }
 }
 
 void zmq::session_base_t::read_activated (pipe_t *pipe_)
 {
     // Skip activating if we're detaching this pipe
-    if (unlikely(pipe_ != pipe && pipe_ != zap_pipe)) {
+    if (unlikely (pipe_ != pipe && pipe_ != zap_pipe)) {
         zmq_assert (terminating_pipes.count (pipe_) == 1);
         return;
     }
@@ -291,7 +327,8 @@ int zmq::session_base_t::zap_connect ()
         return -1;
     }
     if (peer.options.type != ZMQ_REP
-    &&  peer.options.type != ZMQ_ROUTER) {
+    &&  peer.options.type != ZMQ_ROUTER
+    &&  peer.options.type != ZMQ_SERVER) {
         errno = ECONNREFUSED;
         return -1;
     }
@@ -326,6 +363,14 @@ int zmq::session_base_t::zap_connect ()
     return 0;
 }
 
+bool zmq::session_base_t::zap_enabled ()
+{
+    return (
+         options.mechanism != ZMQ_NULL ||
+        (options.mechanism == ZMQ_NULL && options.zap_domain.length() > 0)
+    );
+}
+
 void zmq::session_base_t::process_attach (i_engine *engine_)
 {
     zmq_assert (engine_ != NULL);
@@ -354,9 +399,7 @@ void zmq::session_base_t::process_attach (i_engine *engine_)
         //  Remember the local end of the pipe.
         zmq_assert (!pipe);
         pipe = pipes [0];
-        // Store engine assoc_fd for lilnking pipe to fd 
-        pipe->assoc_fd=engine_->get_assoc_fd();
-        pipes[1]->assoc_fd=pipe->assoc_fd;
+
         //  Ask socket to plug into the remote end of the pipe.
         send_bind (socket, pipes [1]);
     }
@@ -409,8 +452,8 @@ void zmq::session_base_t::process_term (int linger_)
     //  If the termination of the pipe happens before the term command is
     //  delivered there's nothing much to do. We can proceed with the
     //  standard termination immediately.
-    if (!pipe && !zap_pipe) {
-        proceed_with_term ();
+    if (!pipe && !zap_pipe && terminating_pipes.empty ()) {
+        own_t::process_term (0);
         return;
     }
 
@@ -433,20 +476,12 @@ void zmq::session_base_t::process_term (int linger_)
         //  TODO: Should this go into pipe_t::terminate ?
         //  In case there's no engine and there's only delimiter in the
         //  pipe it wouldn't be ever read. Thus we check for it explicitly.
-        pipe->check_read ();
+        if (!engine)
+            pipe->check_read ();
     }
 
     if (zap_pipe != NULL)
         zap_pipe->terminate (false);
-}
-
-void zmq::session_base_t::proceed_with_term ()
-{
-    //  The pending phase has just ended.
-    pending = false;
-
-    //  Continue with standard termination.
-    own_t::process_term (0);
 }
 
 void zmq::session_base_t::timer_event (int id_)
@@ -465,9 +500,9 @@ void zmq::session_base_t::reconnect ()
 {
     //  For delayed connect situations, terminate the pipe
     //  and reestablish later on
-    if (pipe && options.immediate == 1 
-        && addr->protocol != "pgm" && addr->protocol != "epgm" 
-        && addr->protocol != "norm") {
+    if (pipe && options.immediate == 1
+        && addr->protocol != "pgm" && addr->protocol != "epgm"
+        && addr->protocol != "norm" && addr->protocol != "udp") {
         pipe->hiccup ();
         pipe->terminate (false);
         terminating_pipes.insert (pipe);
@@ -498,9 +533,9 @@ void zmq::session_base_t::start_connecting (bool wait_)
     //  Create the connecter object.
 
     if (addr->protocol == "tcp") {
-        if (options.socks_proxy_address != "") {
+        if (!options.socks_proxy_address.empty()) {
             address_t *proxy_address = new (std::nothrow)
-                address_t ("tcp", options.socks_proxy_address);
+                address_t ("tcp", options.socks_proxy_address, this->get_ctx ());
             alloc_assert (proxy_address);
             socks_connecter_t *connecter =
                 new (std::nothrow) socks_connecter_t (
@@ -535,6 +570,32 @@ void zmq::session_base_t::start_connecting (bool wait_)
         return;
     }
 #endif
+
+if (addr->protocol == "udp") {
+    zmq_assert (options.type == ZMQ_DISH || options.type == ZMQ_RADIO);
+
+    udp_engine_t* engine = new (std::nothrow) udp_engine_t ();
+    alloc_assert (engine);
+
+    bool recv = false;
+    bool send = false;
+
+    if (options.type == ZMQ_RADIO) {
+        send = true;
+        recv = false;
+    }
+    else if (options.type == ZMQ_DISH) {
+        send = false;
+        recv = true;
+    }
+
+    int rc = engine->init (addr, send, recv);
+    errno_assert (rc == 0);
+
+    send_attach (this, engine);
+
+    return;
+}
 
 #ifdef ZMQ_HAVE_OPENPGM
 
@@ -578,10 +639,9 @@ void zmq::session_base_t::start_connecting (bool wait_)
         return;
     }
 #endif
-    
+
 #ifdef ZMQ_HAVE_NORM
-    if (addr->protocol == "norm")
-    {
+    if (addr->protocol == "norm") {
         //  At this point we'll create message pipes to the session straight
         //  away. There's no point in delaying it as no concept of 'connect'
         //  exists with NORM anyway.
@@ -611,6 +671,15 @@ void zmq::session_base_t::start_connecting (bool wait_)
     }
 #endif // ZMQ_HAVE_NORM
 
+#if defined ZMQ_HAVE_VMCI
+    if (addr->protocol == "vmci") {
+        vmci_connecter_t *connecter = new (std::nothrow) vmci_connecter_t (
+                io_thread, this, options, addr, wait_);
+        alloc_assert (connecter);
+        launch_child (connecter);
+        return;
+    }
+#endif
+
     zmq_assert (false);
 }
-
